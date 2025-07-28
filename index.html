@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <title>Nixie Clock</title>
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <meta name="description" content="A vintage Nixie tube clock" />
+        <meta name="theme-color" content="#000" />
+        <link rel="shortcut icon" href="favicon.ico" />
+        <title>Nixie Clock</title>
+        <style>
+            *,
+            *::before,
+            *::after {
+                box-sizing: border-box;
+            }
+
+            * {
+                margin: 0;
+            }
+
+            html,
+            body,
+            div,
+            span {
+                margin: 0;
+                padding: 0;
+                border: 0;
+                vertical-align: baseline;
+                -webkit-font-smoothing: antialiased;
+            }
+
+            body {
+                background: #000;
+                height: 100vh;
+            }
+
+            @supports (height: 100dvh) {
+                body {
+                    height: 100dvh;
+                }
+            }
+
+            canvas {
+                display: block;
+                position: fixed;
+                left: 50%;
+            }
+
+            #main {
+                top: 50%;
+                transform: translate(-50%, -50%);
+            }
+
+            #rods {
+                transform: translateX(-50%);
+            }
+        </style>
+    </head>
+    <body>
+        <canvas id="main"></canvas>
+        <canvas id="rods"></canvas>
+        <script>
+            const IMAGE_CACHE = new Map();
+
+            // Canvas aspect ratio is 81:38 (based on 4050x1900 resolution)
+            const CANVAS_ASPECT_RATIO = 81 / 38;
+
+            class Size {
+                constructor(width, height) {
+                    this.width = width;
+                    this.height = height;
+                }
+            }
+
+            class Point {
+                constructor(x, y) {
+                    this.x = x;
+                    this.y = y;
+                }
+            }
+
+            // Element sizes computed relative to the 4050x1900 base resolution.
+            const TUBE_SIZE = new Size(0.18059, 0.95936); // 731.4 x 1822.8
+            const COLON_SIZE = new Size(0.06469, 0.74553); // 262 x 1416.5
+            const BASE_SIZE = new Size(1, 0.08368); // 4050 x 159
+            const SUPPORT_ROD_SCALE = new Size(0.02345, 1); // 95px width (height is irrelevant here)
+
+            // Base plate
+            const BASE_CENTER = new Point(0.5, 0.95832);
+
+            // Nixie tubes
+            const COLON_CENTER = new Point(0.5, 0.62615);
+            const TUBE_CENTERS = [
+                new Point(0.14739, 0.48601),
+                new Point(0.34511, 0.48601),
+                new Point(0.65488, 0.48601),
+                new Point(0.8526, 0.48601),
+            ];
+
+            // Support rods
+            const SUPPORT_ROD_CENTERS = [
+                new Point(0.05913, 0),
+                new Point(0.5, 0),
+                new Point(0.94111, 0),
+            ];
+
+            const TubeIndex = Object.freeze({ A: 0, B: 1, C: 2, D: 3 });
+            const SupportRodIndex = Object.freeze({ A: 0, B: 1, C: 2 });
+
+            class CElementType {
+                constructor(type, index = null) {
+                    this.type = type;
+                    this.index = index;
+                }
+
+                getRelativeSize() {
+                    switch (this.type) {
+                        case "tube":
+                            return TUBE_SIZE;
+                        case "colon":
+                            return COLON_SIZE;
+                        case "base":
+                            return BASE_SIZE;
+                        case "supportRod":
+                            return SUPPORT_ROD_SCALE;
+                    }
+                }
+
+                getRelativeCenter() {
+                    if (this.type === "tube") return TUBE_CENTERS[this.index];
+                    if (this.type === "supportRod")
+                        return SUPPORT_ROD_CENTERS[this.index];
+                    if (this.type === "colon") return COLON_CENTER;
+                    if (this.type === "base") return BASE_CENTER;
+                }
+            }
+
+            const loadImage = (src) => {
+                if (IMAGE_CACHE.has(src)) {
+                    return Promise.resolve(IMAGE_CACHE.get(src));
+                }
+
+                return new Promise((resolve, reject) => {
+                    const img = new Image();
+                    img.onload = () => {
+                        IMAGE_CACHE.set(src, img);
+                        resolve(img);
+                    };
+                    img.onerror = () =>
+                        reject(new Error(`failed to load asset: ${src}`));
+                    img.src = src;
+                });
+            };
+
+            class CElement {
+                constructor(type, name) {
+                    this.type = type;
+                    this.imgName = name;
+                    this.inner = null;
+                }
+
+                async load() {
+                    if (this.inner) {
+                        return Promise.resolve(this);
+                    }
+
+                    return loadImage(`src/assets/${this.imgName}`).then(
+                        (img) => {
+                            this.inner = img;
+                            return this;
+                        },
+                    );
+                }
+            }
+
+            class ClockManager {
+                constructor({ mainCanvas, rodsCanvas }) {
+                    this.mainCanvas = mainCanvas;
+                    this.rodsCanvas = rodsCanvas;
+                    // TODO: Detect 24 hour cycle from client device
+                    // this.is24Hour = this.detect24HourFormat();
+                    this.is24Hour = false;
+                    this.assetsLoaded = false;
+
+                    this.elements = {
+                        base: new CElement(
+                            new CElementType("base"),
+                            "base_default.png",
+                        ),
+                        colon: new CElement(
+                            new CElementType("colon"),
+                            "colon_on.png",
+                        ),
+                        tubeADigits: [0, 1, 2].map(
+                            (i) =>
+                                new CElement(
+                                    new CElementType("tube", TubeIndex.A),
+                                    `tube_a_0${i}.png`,
+                                ),
+                        ),
+                        tubeAEnvOff: new CElement(
+                            new CElementType("tube", TubeIndex.A),
+                            "tube_a_env_off.png",
+                        ),
+                        tubeAOff: new CElement(
+                            new CElementType("tube", TubeIndex.A),
+                            "tube_a_off.png",
+                        ),
+                        //
+                        tubeBDigits: Array.from(
+                            { length: 10 },
+                            (_, i) =>
+                                new CElement(
+                                    new CElementType("tube", TubeIndex.B),
+                                    `tube_b_0${i}.png`,
+                                ),
+                        ),
+                        tubeBEnvOff: new CElement(
+                            new CElementType("tube", TubeIndex.B),
+                            "tube_b_env_off.png",
+                        ),
+                        tubeBOff: new CElement(
+                            new CElementType("tube", TubeIndex.B),
+                            "tube_b_off.png",
+                        ),
+                        //
+                        tubeCDigits: Array.from(
+                            { length: 6 },
+                            (_, i) =>
+                                new CElement(
+                                    new CElementType("tube", TubeIndex.C),
+                                    `tube_c_0${i}.png`,
+                                ),
+                        ),
+                        tubeCEnvOff: new CElement(
+                            new CElementType("tube", TubeIndex.C),
+                            "tube_c_env_off.png",
+                        ),
+                        tubeCOff: new CElement(
+                            new CElementType("tube", TubeIndex.C),
+                            "tube_c_off.png",
+                        ),
+                        //
+                        tubeDDigits: Array.from(
+                            { length: 10 },
+                            (_, i) =>
+                                new CElement(
+                                    new CElementType("tube", TubeIndex.D),
+                                    `tube_d_0${i}.png`,
+                                ),
+                        ),
+                        tubeDEnvOff: new CElement(
+                            new CElementType("tube", TubeIndex.D),
+                            "tube_d_env_off.png",
+                        ),
+                        tubeDOff: new CElement(
+                            new CElementType("tube", TubeIndex.D),
+                            "tube_d_off.png",
+                        ),
+                        //
+                        supportRodA: new CElement(
+                            new CElementType("supportRod", SupportRodIndex.A),
+                            "rod.png",
+                        ),
+                        supportRodB: new CElement(
+                            new CElementType("supportRod", SupportRodIndex.B),
+                            "rod.png",
+                        ),
+                        supportRodC: new CElement(
+                            new CElementType("supportRod", SupportRodIndex.C),
+                            "rod.png",
+                        ),
+                    };
+
+                    this.currentDigits = [];
+                    this.loadElements().then(() =>
+                        console.log("starting clock..."),
+                    );
+                }
+
+                getCurrentDigitIndices(date = new Date()) {
+                    const h24 = date.getHours();
+                    const minute = date.getMinutes();
+                    const h = this.is24Hour ? h24 : h24 % 12 || 12;
+                    return {
+                        tubeA: Math.min(Math.floor(h / 10), 2),
+                        tubeB: h % 10,
+                        tubeC: Math.min(Math.floor(minute / 10), 5),
+                        tubeD: minute % 10,
+                        rawHour24: h24,
+                        minute,
+                    };
+                }
+
+                async loadElements() {
+                    const elements = [
+                        ...this.elements.tubeADigits,
+                        ...this.elements.tubeBDigits,
+                        ...this.elements.tubeCDigits,
+                        ...this.elements.tubeDDigits,
+                        this.elements.tubeAEnvOff,
+                        this.elements.tubeAOff,
+                        this.elements.tubeBEnvOff,
+                        this.elements.tubeBOff,
+                        this.elements.tubeCEnvOff,
+                        this.elements.tubeCOff,
+                        this.elements.tubeDEnvOff,
+                        this.elements.tubeDOff,
+                        this.elements.base,
+                        this.elements.colon,
+                        this.elements.supportRodA,
+                        this.elements.supportRodB,
+                        this.elements.supportRodC,
+                    ];
+
+                    await Promise.all(elements.map((e) => e.load()));
+
+                    this.assetsLoaded = true;
+
+                    // Draw current frame
+                    this.draw(new Date());
+
+                    // Start render loop
+                    this.scheduleNextDraw();
+                }
+
+                drawDigitTubes(ctx, size, hour24, minute) {
+                    const { tubeA, tubeB, tubeC, tubeD } =
+                        this.getCurrentDigitIndices(new Date());
+
+                    const digits = [
+                        this.elements.tubeADigits[tubeA],
+                        this.elements.tubeBDigits[tubeB],
+                        this.elements.tubeCDigits[tubeC],
+                        this.elements.tubeDDigits[tubeD],
+                    ];
+
+                    digits.forEach((el) => {
+                        if (el.inner) this.drawElement(ctx, size, el);
+                    });
+
+                    if (!this.is24Hour) {
+                        this.drawMeridiem(
+                            ctx,
+                            size,
+                            hour24 >= 12 ? "PM" : "AM",
+                        );
+                    }
+                }
+
+                drawMeridiem(ctx, size, text) {
+                    ctx.save();
+                    const fontSize = 20;
+                    ctx.globalAlpha = 0.35;
+                    ctx.font = `${fontSize}px sans-serif`;
+                    ctx.fillStyle = "gray";
+                    const w = ctx.measureText(text).width;
+                    ctx.fillText(
+                        text,
+                        size.width / 2 - w / 2,
+                        size.height * 0.12 + fontSize / 2,
+                    );
+                    ctx.restore();
+                }
+
+                drawElement(ctx, size, elem) {
+                    const { x, y } = elem.type.getRelativeCenter();
+                    const { width, height } = elem.type.getRelativeSize();
+                    ctx.drawImage(
+                        elem.inner,
+                        x * size.width - (width * size.width) / 2,
+                        y * size.height - (height * size.height) / 2,
+                        width * size.width,
+                        height * size.height,
+                    );
+                }
+
+                drawRod(ctx, size, rod) {
+                    const { x } = rod.type.getRelativeCenter();
+                    const { width } = rod.type.getRelativeSize();
+                    ctx.drawImage(
+                        rod.inner,
+                        x * size.width - (width * size.width) / 2,
+                        0,
+                        width * size.width,
+                        size.height,
+                    );
+                }
+
+                resizeCanvas() {
+                    const container = this.mainCanvas.parentElement;
+                    if (!container) return;
+
+                    const cw = Math.min(container.clientWidth, 3200); // 3200 max width
+                    const ch = container.clientHeight;
+                    const padding = 0.2 * cw; // Horizontal padding
+                    let w, h;
+
+                    if (cw / ch > CANVAS_ASPECT_RATIO) {
+                        // container too wide
+                        h = ch;
+                        w = Math.floor(h * CANVAS_ASPECT_RATIO) - padding;
+                    } else {
+                        w = cw - padding;
+                        h = Math.floor(w / CANVAS_ASPECT_RATIO);
+                    }
+
+                    this.mainCanvas.width = w;
+                    this.mainCanvas.height = h;
+
+                    this.rodsCanvas.width = w;
+                    this.rodsCanvas.height =
+                        window.innerHeight / 2 - this.mainCanvas.height / 2;
+                    this.rodsCanvas.style.top = `calc(50% + ${this.mainCanvas.height / 2}px)`;
+
+                    if (this.assetsLoaded) {
+                        this.draw(new Date());
+                    }
+                }
+
+                draw(time = new Date()) {
+                    // draw support rods first (appear behind tubes)
+                    {
+                        const canvas = this.rodsCanvas;
+                        const ctx = canvas.getContext("2d");
+                        const size = new Size(canvas.width, canvas.height);
+                        ctx.clearRect(0, 0, size.width, size.height);
+
+                        [
+                            this.elements.supportRodA,
+                            this.elements.supportRodB,
+                            this.elements.supportRodC,
+                        ].forEach((rod) => this.drawRod(ctx, size, rod));
+                    }
+
+                    // other elements
+                    {
+                        const canvas = this.mainCanvas;
+                        const ctx = canvas.getContext("2d");
+                        const size = new Size(canvas.width, canvas.height);
+                        ctx.clearRect(0, 0, size.width, size.height);
+
+                        this.drawDigitTubes(
+                            ctx,
+                            size,
+                            time.getHours(),
+                            time.getMinutes(),
+                        );
+
+                        this.drawElement(ctx, size, this.elements.colon);
+                        this.drawElement(ctx, size, this.elements.base);
+                    }
+                }
+
+                scheduleNextDraw() {
+                    // schedule on next full minute to minimize drift
+                    const now = new Date();
+                    const msTillNextMinute =
+                        60_000 -
+                        (now.getSeconds() * 1000 + now.getMilliseconds());
+
+                    setTimeout(() => {
+                        this.draw(new Date());
+                        this.scheduleNextDraw();
+                    }, msTillNextMinute);
+                }
+            }
+
+            window.addEventListener("load", () => {
+                const clock = new ClockManager({
+                    mainCanvas: document.getElementById("main"),
+                    rodsCanvas: document.getElementById("rods"),
+                });
+
+                clock.resizeCanvas();
+                window.addEventListener(
+                    "resize",
+                    clock.resizeCanvas.bind(clock),
+                );
+            });
+        </script>
+    </body>
+</html>
